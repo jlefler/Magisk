@@ -12,10 +12,10 @@
 char *argv0;
 
 char *applet[] =
-	{ "su", "resetprop", "magiskpolicy", "supolicy", "sepolicy-inject", "magiskhide", NULL };
+	{ "su", "resetprop", "magiskpolicy", "supolicy", "magiskhide", NULL };
 
 int (*applet_main[]) (int, char *[]) =
-	{ su_client_main, resetprop_main, magiskpolicy_main, magiskpolicy_main, magiskpolicy_main, magiskhide_main, NULL };
+	{ su_client_main, resetprop_main, magiskpolicy_main, magiskpolicy_main, magiskhide_main, NULL };
 
 int create_links(const char *bin, const char *path) {
 	char self[PATH_MAX], linkpath[PATH_MAX];
@@ -32,53 +32,42 @@ int create_links(const char *bin, const char *path) {
 	return ret;
 }
 
-// Global error hander function
-// Should be changed each thread/process
-__thread void (*err_handler)(void);
-
 static void usage() {
 	fprintf(stderr,
 		"Magisk v" xstr(MAGISK_VERSION) "(" xstr(MAGISK_VER_CODE) ") (by topjohnwu) multi-call binary\n"
 		"\n"
 		"Usage: %s [applet [arguments]...]\n"
-		"   or: %s --install [SOURCE] DIR\n"
-		"       if SOURCE not provided, will link itself\n"
-		"   or: %s --list\n"
-		"   or: %s --createimg IMG SIZE\n"
-		"       create ext4 image, SIZE is interpreted in MB\n"
-		"   or: %s --imgsize IMG\n"
-		"   or: %s --resizeimg IMG SIZE\n"
-		"       SIZE is interpreted in MB\n"
-		"   or: %s --mountimg IMG PATH\n"
-		"       mount IMG to PATH and prints the loop device\n"
-		"   or: %s --umountimg PATH LOOP\n"
-		"   or: %s --[boot stage]\n"
-		"       start boot stage service\n"
-		"   or: %s [options]\n"
-		"   or: applet [arguments]...\n"
-		"\n"
-		"Supported boot stages:\n"
-		"   post-fs, post-fs-data, service\n"
+		"   or: %s [options]...\n"
 		"\n"
 		"Options:\n"
-		"   -c          print client version\n"
-		"   -v          print daemon version\n"
-		"   -V          print daemon version code\n"
+		"   -c                        print current binary version\n"
+		"   -v                        print running daemon version\n"
+		"   -V                        print running daemon version code\n"
+		"   --list                    list all availible applets\n"
+        "   --install [SOURCE] DIR    symlink all applets to DIR. SOURCE is optional\n"
+		"   --createimg IMG SIZE      create ext4 image. SIZE is interpreted in MB\n"
+		"   --imgsize IMG             report ext4 image used/total size\n"
+		"   --resizeimg IMG SIZE      resize ext4 image. SIZE is interpreted in MB\n"
+		"   --mountimg IMG PATH       mount IMG to PATH and prints the loop device\n"
+		"   --umountimg PATH LOOP     unmount PATH and delete LOOP device\n"
+		"   --[init service]          start init service\n"
+		"   --unlock-blocks           set BLKROSET flag to OFF for all block devices\n"
+		"   --restorecon              fix selinux context on Magisk files and folders\n"
+		"\n"
+		"Supported init services:\n"
+		"   daemon post-fs, post-fs-data, service\n"
 		"\n"
 		"Supported applets:\n"
-	, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+	, argv0, argv0);
 
-	for (int i = 0; applet[i]; ++i) {
+	for (int i = 0; applet[i]; ++i)
 		fprintf(stderr, i ? ", %s" : "    %s", applet[i]);
-	}
-	fprintf(stderr, "\n");
+	fprintf(stderr, "\n\n");
 	exit(1);
 }
 
 int main(int argc, char *argv[]) {
 	argv0 = argv[0];
-	// Exit the whole app if error occurs by default
-	err_handler = exit_proc;
 	char * arg = strrchr(argv[0], '/');
 	if (arg) ++arg;
 	else arg = argv[0];
@@ -149,6 +138,15 @@ int main(int argc, char *argv[]) {
 			if (argc < 4) usage();
 			umount_image(argv[2], argv[3]);
 			return 0;
+		} else if (strcmp(argv[1], "--unlock-blocks") == 0) {
+			unlock_blocks();
+			return 0;
+		} else if (strcmp(argv[1], "--restorecon") == 0) {
+			fix_filecon();
+			return 0;
+		} else if (strcmp(argv[1], "--daemon") == 0) {
+			// Start daemon, this process won't return
+			start_daemon();
 		} else if (strcmp(argv[1], "--post-fs") == 0) {
 			int fd = connect_daemon();
 			write_int(fd, POST_FS);

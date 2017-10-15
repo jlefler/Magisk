@@ -28,10 +28,6 @@ static int seperate_vendor = 0;
 
 extern char **environ;
 
-#ifdef MAGISK_DEBUG
-static int debug_log_pid, debug_log_fd;
-#endif
-
 /******************
  * Node structure *
  ******************/
@@ -149,7 +145,7 @@ static void exec_common_script(const char* stage) {
 	struct dirent *entry;
 	snprintf(buf, PATH_MAX, "%s/%s.d", COREDIR, stage);
 
-	if (!(dir = opendir(buf)))
+	if (!(dir = xopendir(buf)))
 		return;
 
 	while ((entry = xreaddir(dir))) {
@@ -194,7 +190,7 @@ static void construct_tree(const char *module, struct node_entry *parent) {
 	char *parent_path = get_full_path(parent);
 	snprintf(buf, PATH_MAX, "%s/%s%s", MOUNTPOINT, module, parent_path);
 
-	if (!(dir = opendir(buf)))
+	if (!(dir = xopendir(buf)))
 		goto cleanup;
 
 	while ((entry = xreaddir(dir))) {
@@ -262,7 +258,7 @@ static void clone_skeleton(struct node_entry *node) {
 	// Clone the structure
 	char *full_path = get_full_path(node);
 	snprintf(buf, PATH_MAX, "%s%s", MIRRDIR, full_path);
-	if (!(dir = opendir(buf)))
+	if (!(dir = xopendir(buf)))
 		goto cleanup;
 	while ((entry = xreaddir(dir))) {
 		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
@@ -276,14 +272,21 @@ static void clone_skeleton(struct node_entry *node) {
 	}
 	closedir(dir);
 
-	snprintf(buf, PATH_MAX, "%s%s", DUMMDIR, full_path);
-	mkdir_p(buf, 0755);
-	clone_attr(full_path, buf);
-	if (node->status & IS_SKEL)
-		bind_mount(buf, full_path);
+	if (node->status & IS_SKEL) {
+		struct stat s;
+		char *con;
+		xstat(full_path, &s);
+		getfilecon(full_path, &con);
+		LOGI("tmpfs: %s\n", full_path);
+		xmount("tmpfs", full_path, "tmpfs", 0, NULL);
+		chmod(full_path, s.st_mode & 0777);
+		chown(full_path, s.st_uid, s.st_gid);
+		setfilecon(full_path, con);
+		free(con);
+	}
 
 	vec_for_each(node->children, child) {
-		snprintf(buf, PATH_MAX, "%s%s/%s", DUMMDIR, full_path, child->name);
+		snprintf(buf, PATH_MAX, "%s/%s", full_path, child->name);
 
 		// Create the dummy file/directory
 		if (IS_DIR(child))
@@ -303,7 +306,7 @@ static void clone_skeleton(struct node_entry *node) {
 			// Mount from module file to dummy file
 			snprintf(buf2, PATH_MAX, "%s/%s%s/%s", MOUNTPOINT, child->module, full_path, child->name);
 		} else if (child->status & (IS_SKEL | IS_INTER)) {
-			// It's a intermediate folder, recursive clone
+			// It's an intermediate folder, recursive clone
 			clone_skeleton(child);
 			continue;
 		} else if (child->status & IS_DUMMY) {
@@ -315,7 +318,7 @@ static void clone_skeleton(struct node_entry *node) {
 			// Copy symlinks directly
 			cp_afc(buf2, buf);
 			#ifdef MAGISK_DEBUG
-				LOGD("cplink: %s -> %s\n",buf2, buf);
+				LOGI("cplink: %s -> %s\n",buf2, buf);
 			#else
 				LOGI("cplink: %s\n", buf);
 			#endif
@@ -392,7 +395,44 @@ static void simple_mount(const char *path) {
  * Miscellaneous *
  *****************/
 
-static void mount_mirrors() {
+// A one time setup
+static void daemon_init() {
+	LOGI("* Creating /sbin overlay");
+	DIR *dir;
+	struct dirent *entry;
+	int root, sbin;
+	// Setup links under /sbin
+	xmount(NULL, "/", NULL, MS_REMOUNT, NULL);
+	xmkdir("/root", 0755);
+	chmod("/root", 0755);
+	root = xopen("/root", O_RDONLY | O_CLOEXEC);
+	sbin = xopen("/sbin", O_RDONLY | O_CLOEXEC);
+	dir = xfdopendir(sbin);
+	while((entry = xreaddir(dir))) {
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+		linkat(sbin, entry->d_name, root, entry->d_name, 0);
+		if (strcmp(entry->d_name, "magisk") == 0)
+			unlinkat(sbin, entry->d_name, 0);
+	}
+	close(sbin);
+	mount("tmpfs", "/sbin", "tmpfs", 0, NULL);
+	sbin = xopen("/sbin", O_RDONLY | O_CLOEXEC);
+	fchmod(sbin, 0755);
+	fsetfilecon(sbin, "u:object_r:rootfs:s0");
+	dir = xfdopendir(root);
+	while((entry = xreaddir(dir))) {
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+		snprintf(buf, PATH_MAX, "/root/%s", entry->d_name);
+		snprintf(buf2, PATH_MAX, "/sbin/%s", entry->d_name);
+		xsymlink(buf, buf2);
+	}
+	for (int i = 0; applet[i]; ++i) {
+		snprintf(buf2, PATH_MAX, "/sbin/%s", applet[i]);
+		xsymlink("/root/magisk", buf2);
+	}
+	xmkdir("/magisk", 0755);
+	xmount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL);
+
 	LOGI("* Mounting mirrors");
 	struct vector mounts;
 	vec_init(&mounts);
@@ -414,51 +454,51 @@ static void mount_mirrors() {
 			xmkdir_p(MIRRDIR "/system", 0755);
 			xmount(buf, MIRRDIR "/system", "ext4", MS_RDONLY, NULL);
 			#ifdef MAGISK_DEBUG
-				LOGD("mount: %s -> %s\n", buf, MIRRDIR "/system");
+				LOGI("mount: %s -> %s\n", buf, MIRRDIR "/system");
 			#else
 				LOGI("mount: %s\n", MIRRDIR "/system");
 			#endif
-			continue;
-		}
-		if (strstr(line, " /vendor ")) {
+		} else if (strstr(line, " /vendor ")) {
 			seperate_vendor = 1;
 			sscanf(line, "%s", buf);
 			xmkdir_p(MIRRDIR "/vendor", 0755);
 			xmount(buf, MIRRDIR "/vendor", "ext4", MS_RDONLY, NULL);
 			#ifdef MAGISK_DEBUG
-				LOGD("mount: %s -> %s\n", buf, MIRRDIR "/vendor");
+				LOGI("mount: %s -> %s\n", buf, MIRRDIR "/vendor");
 			#else
 				LOGI("mount: %s\n", MIRRDIR "/vendor");
 			#endif
-			continue;
 		}
+		free(line);
 	}
-	vec_deep_destroy(&mounts);
+	vec_destroy(&mounts);
 	if (!seperate_vendor) {
-		symlink(MIRRDIR "/system/vendor", MIRRDIR "/vendor");
+		xsymlink(MIRRDIR "/system/vendor", MIRRDIR "/vendor");
 		#ifdef MAGISK_DEBUG
-			LOGD("link: %s -> %s\n", MIRRDIR "/system/vendor", MIRRDIR "/vendor");
+			LOGI("link: %s -> %s\n", MIRRDIR "/system/vendor", MIRRDIR "/vendor");
 		#else
 			LOGI("link: %s\n", MIRRDIR "/vendor");
 		#endif
 	}
-	mkdir_p(MIRRDIR "/bin", 0755);
+	xmkdir_p(MIRRDIR "/bin", 0755);
 	bind_mount(DATABIN, MIRRDIR "/bin");
-}
 
-static void link_busybox() {
-	mkdir_p(BBPATH, 0755);
+	LOGI("* Setting up internal busybox");
+	xmkdir_p(BBPATH, 0755);
 	exec_command_sync(MIRRDIR "/bin/busybox", "--install", "-s", BBPATH, NULL);
-	symlink(MIRRDIR "/bin/busybox", BBPATH "/busybox");
+	xsymlink(MIRRDIR "/bin/busybox", BBPATH "/busybox");
 }
 
 static int prepare_img() {
-	int new_img = 0;
+	// First merge images
+	if (merge_img("/data/magisk_merge.img", MAINIMG)) {
+		LOGE("Image merge /data/magisk_merge.img -> " MAINIMG " failed!\n");
+		return 1;
+	}
 
 	if (access(MAINIMG, F_OK) == -1) {
 		if (create_img(MAINIMG, 64))
 			return 1;
-		new_img = 1;
 	}
 
 	LOGI("* Mounting " MAINIMG "\n");
@@ -469,66 +509,68 @@ static int prepare_img() {
 
 	vec_init(&module_list);
 
-	if (new_img) {
-		xmkdir(COREDIR, 0755);
-		xmkdir(COREDIR "/post-fs-data.d", 0755);
-		xmkdir(COREDIR "/service.d", 0755);
-		xmkdir(COREDIR "/props", 0755);
-	} else {
-		DIR *dir = xopendir(MOUNTPOINT);
-		struct dirent *entry;
-		while ((entry = xreaddir(dir))) {
-			if (entry->d_type == DT_DIR) {
-				if (strcmp(entry->d_name, ".") == 0 ||
-					strcmp(entry->d_name, "..") == 0 ||
-					strcmp(entry->d_name, ".core") == 0 ||
-					strcmp(entry->d_name, "lost+found") == 0)
-					continue;
-				snprintf(buf, PATH_MAX, "%s/%s/remove", MOUNTPOINT, entry->d_name);
-				if (access(buf, F_OK) == 0) {
-					snprintf(buf, PATH_MAX, "%s/%s", MOUNTPOINT, entry->d_name);
-					exec_command_sync(BBPATH "/rm", "-rf", buf, NULL);
-					continue;
-				}
-				snprintf(buf, PATH_MAX, "%s/%s/disable", MOUNTPOINT, entry->d_name);
-				if (access(buf, F_OK) == 0)
-					continue;
-				vec_push_back(&module_list, strdup(entry->d_name));
+	xmkdir(COREDIR, 0755);
+	xmkdir(COREDIR "/post-fs-data.d", 0755);
+	xmkdir(COREDIR "/service.d", 0755);
+	xmkdir(COREDIR "/props", 0755);
+
+	DIR *dir = xopendir(MOUNTPOINT);
+	struct dirent *entry;
+	while ((entry = xreaddir(dir))) {
+		if (entry->d_type == DT_DIR) {
+			if (strcmp(entry->d_name, ".") == 0 ||
+				strcmp(entry->d_name, "..") == 0 ||
+				strcmp(entry->d_name, ".core") == 0 ||
+				strcmp(entry->d_name, "lost+found") == 0)
+				continue;
+			snprintf(buf, PATH_MAX, "%s/%s/remove", MOUNTPOINT, entry->d_name);
+			if (access(buf, F_OK) == 0) {
+				snprintf(buf, PATH_MAX, "%s/%s", MOUNTPOINT, entry->d_name);
+				rm_rf(buf);
+				continue;
 			}
+			snprintf(buf, PATH_MAX, "%s/%s/disable", MOUNTPOINT, entry->d_name);
+			if (access(buf, F_OK) == 0)
+				continue;
+			vec_push_back(&module_list, strdup(entry->d_name));
 		}
-
-		closedir(dir);
-
-		// Trim image
-		umount_image(MOUNTPOINT, magiskloop);
-		free(magiskloop);
-		trim_img(MAINIMG);
-
-		// Remount them back :)
-		magiskloop = mount_image(MAINIMG, MOUNTPOINT);
-		free(magiskloop);
 	}
+
+	closedir(dir);
+
+	// Trim image
+	umount_image(MOUNTPOINT, magiskloop);
+	free(magiskloop);
+	trim_img(MAINIMG);
+
+	// Remount them back :)
+	magiskloop = mount_image(MAINIMG, MOUNTPOINT);
+	free(magiskloop);
+
+	// Fix file selinux contexts
+	fix_filecon();
 	return 0;
+}
+
+void fix_filecon() {
+	int dirfd = xopen(MOUNTPOINT, O_RDONLY | O_CLOEXEC);
+	restorecon(dirfd, 0);
+	close(dirfd);
+	dirfd = xopen(DATABIN, O_RDONLY | O_CLOEXEC);
+	restorecon(dirfd, 1);
+	close(dirfd);
 }
 
 /****************
  * Entry points *
  ****************/
 
-static void *start_magisk_hide(void *args) {
-	launch_magiskhide(-1);
-	return NULL;
-}
-
 static void unblock_boot_process() {
-	close(open(UNBLOCKFILE, O_RDONLY | O_CREAT));
+	close(xopen(UNBLOCKFILE, O_RDONLY | O_CREAT));
 	pthread_exit(NULL);
 }
 
 void post_fs(int client) {
-	// Error handler
-	err_handler = unblock_boot_process;
-
 	LOGI("** post-fs mode running\n");
 	// ack
 	write_int(client, 0);
@@ -550,24 +592,14 @@ unblock:
 }
 
 void post_fs_data(int client) {
-	// Error handler
-	err_handler = unblock_boot_process;
-
 	// ack
 	write_int(client, 0);
 	close(client);
 	if (!check_data())
 		goto unblock;
 
-	// Start log monitor
-	monitor_logs();
-
-#ifdef MAGISK_DEBUG
-	// Start debug logs in new process
-	debug_log_fd = xopen(DEBUG_LOG, O_WRONLY | O_CREAT | O_CLOEXEC | O_TRUNC, 0644);
-	debug_log_pid = exec_command(0, &debug_log_fd, NULL, "logcat", "-v", "brief", NULL);
-	close(debug_log_fd);
-#endif
+	// Start the debug log
+	start_debug_full_log();
 
 	LOGI("** post-fs-data mode running\n");
 
@@ -584,23 +616,15 @@ void post_fs_data(int client) {
 	else if (access("/data/user_de/0/com.topjohnwu.magisk/install", F_OK) == 0)
 		bin_path = "/data/user_de/0/com.topjohnwu.magisk/install";
 	if (bin_path) {
-		exec_command_sync("rm", "-rf", DATABIN, NULL);
-		exec_command_sync("cp", "-r", bin_path, DATABIN, NULL);
-		exec_command_sync("rm", "-rf", bin_path, NULL);
-		exec_command_sync("chmod", "-R", "755", bin_path, NULL);
+		rm_rf(DATABIN);
+		cp_afc(bin_path, DATABIN);
+		rm_rf(bin_path);
 		// Lazy.... use shell blob to match files
 		exec_command_sync("sh", "-c", "mv /data/magisk/stock_boot* /data", NULL);
 	}
 
-	// Link busybox
-	mount_mirrors();
-	link_busybox();
-
-	// Merge images
-	if (merge_img("/data/magisk_merge.img", MAINIMG)) {
-		LOGE("Image merge %s -> %s failed!\n", "/data/magisk_merge.img", MAINIMG);
-		goto unblock;
-	}
+	// Initialize
+	daemon_init();
 
 	// uninstaller
 	if (access(UNINSTALLER, F_OK) == 0) {
@@ -610,7 +634,7 @@ void post_fs_data(int client) {
 		return;
 	}
 
-	// Trim, mount magisk.img, which will also travel through the modules
+	// Merge, trim, mount magisk.img, which will also travel through the modules
 	// After this, it will create the module list
 	if (prepare_img())
 		goto core_only; // Mounting fails, we can only do core only stuffs
@@ -662,7 +686,7 @@ void post_fs_data(int client) {
 		if (access(buf, F_OK) == 0) {
 			snprintf(buf2, PATH_MAX, "%s/%s/vendor", MOUNTPOINT, module);
 			unlink(buf2);
-			symlink(buf, buf2);
+			xsymlink(buf, buf2);
 		}
 		construct_tree(module, sys_root);
 	}
@@ -700,14 +724,7 @@ core_only:
 		bind_mount(HOSTSFILE, "/system/etc/hosts");
 	}
 
-	// Enable magiskhide by default, only disable when set explicitly
-	char *hide_prop = getprop(MAGISKHIDE_PROP);
-	if (hide_prop == NULL || strcmp(hide_prop, "0") != 0) {
-		pthread_t thread;
-		xpthread_create(&thread, NULL, start_magisk_hide, NULL);
-		pthread_detach(thread);
-	}
-	free(hide_prop);
+	auto_start_magiskhide();
 
 unblock:
 	unblock_boot_process();
@@ -765,9 +782,5 @@ core_only:
 	buf = buf2 = NULL;
 	vec_deep_destroy(&module_list);
 
-#ifdef MAGISK_DEBUG
-	// Stop recording the boot logcat after every boot task is done
-	kill(debug_log_pid, SIGTERM);
-	waitpid(debug_log_pid, NULL, 0);
-#endif
+	stop_debug_full_log();
 }
